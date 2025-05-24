@@ -2,73 +2,77 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
+import httpx
+import os
+
+# Groq API key (best stored in environment variables)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")  # Replace or set via .env
 
 app = FastAPI()
 
-# Allow frontend access (CORS)
+# Enable CORS for all origins (you can restrict in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (or restrict to frontend domain)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load DialoGPT model & tokenizer
-MODEL_NAME = "microsoft/DialoGPT-medium"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-
-# Global chat history
-chat_history_ids = None
-
 # Pydantic models
 class Message(BaseModel):
     text: str
-    sender: str
+    sender: str  # 'user' or 'ai'
 
 class ChatRequest(BaseModel):
     message: str
     conversation_history: List[Message] = []
 
+# Chat endpoint
 @app.post("/chat")
-async def chat_with_bot(request: ChatRequest):
+async def chat_with_groq(request: ChatRequest):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}"
+    }
+
+    # Format messages for Groq
+    formatted_messages = []
+    for msg in request.conversation_history:
+        role = "user" if msg.sender == "user" else "assistant"
+        formatted_messages.append({"role": role, "content": msg.text})
+
+    # Add the new user message
+    formatted_messages.append({"role": "user", "content": request.message})
+
+    payload = {
+        "model": "llama3-70b-8192",
+        "messages": formatted_messages,
+        "temperature": 0.7,
+        "max_tokens": 256
+    }
+
     try:
-        global chat_history_ids
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            result = response.json()
+            return {
+                "response": result["choices"][0]["message"]["content"],
+                "status": "success"
+            }
 
-        # Encode new user input
-        new_input_ids = tokenizer.encode(request.message + tokenizer.eos_token, return_tensors='pt')
-
-        # Append to history or start fresh
-        if chat_history_ids is not None:
-            bot_input_ids = torch.cat([chat_history_ids, new_input_ids], dim=-1)
-        else:
-            bot_input_ids = new_input_ids
-
-        # Generate response
-        chat_history_ids = model.generate(
-            bot_input_ids,
-            max_length=1000,
-            pad_token_id=tokenizer.eos_token_id,
-            no_repeat_ngram_size=3,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.75
-        )
-
-        # Decode response
-        response = tokenizer.decode(chat_history_ids[:, bot_input_ids.shape[-1]:][0], skip_special_tokens=True)
-
-        return {
-            "response": response.strip(),
-            "status": "success"
-        }
-
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Groq API error: {e.response.text}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+# Run with: uvicorn main:app --reload
+
 
 # Run the server
 if __name__ == "__main__":
